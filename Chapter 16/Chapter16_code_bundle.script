@@ -1,0 +1,375 @@
+Connect to the database as SYS user and investigate the package body by running the following command:
+
+SQL> desc DBMS_SPACE
+
+
+Since your Oracle AI database might have a BIGFILE tablespace type by default, that can be verified by running the following command from SYS user:
+
+SQL> select property_value
+from database_properties
+where property_name = 'DEFAULT_TBS_TYPE';
+
+Connect as SYS user and run the following command to create a tablespace:
+
+SQL> create smallfile tablespace tbs_shrink_test
+datafile '+DATA' size 200m autoextend on next 50m maxsize 400m;
+
+If you are not using ASM, use an actual directory path instead of +DATA, such as:
+
+SQL> create smallfile tablespace tbs_shrink_test
+datafile '/u01/app/oracle/oradata/ORCL/PDB/tbs_shrink_test01.dbf' size 200m autoextend on next 50m maxsize 400m;
+
+Create a user and the necessary grants:
+
+SQL> create user shrinku identified by "Welcome_26ai"
+default tablespace tbs_shrink_test
+temporary tablespace temp
+quota unlimited on tbs_shrink_test;
+
+grant create session, create table, create procedure, create sequence to shrinku;
+grant execute on dbms_space to shrinku;
+grant select_catalog_role to shrinku;
+
+Connect as newly created user to the target database and create a churn table:
+
+sqlplus shrinku/"Welcome_26ai"@localhost:1521/PDB
+
+SQL> create table t1_churn (
+ id        number generated always as identity,
+ pad       varchar2(4000), 
+ upd_flag  number,
+ created_on date default sysdate
+) tablespace tbs_shrink_test;
+Insert enough rows to consume space. Do the bulk insert:
+SQL> insert /*+ append */ into t1_churn(pad, upd_flag)
+select rpad('X', 3900, 'X'), 0
+from   dual
+connect by level <= 30000;   
+
+commit;
+
+Create some waste inside the segment by doing the following DML operations:
+
+SQL> update t1_churn
+set    upd_flag = 1
+where  mod(id, 3) = 0;
+delete from t1_churn
+where  mod(id, 2) = 0;
+commit;
+
+3)	Add a second datafile to the existing tablespace
+
+Connect as SYS user and run:
+
+sqlplus / as sysdba
+SQL> alter session set container=pdb;
+
+Add the second datafile to tbs_shrink_test tablespace:
+
+SQL> alter tablespace tbs_shrink_test
+add datafile '+DATA' size 300m autoextend on next 50m maxsize 800m;
+
+If you have datafiles on filesystems, then indicate the path:
+
+alter tablespace tbs_shrink_test
+add datafile '/u01/app/oracle/oradata/ORCL/PDB/tbs_shrink_test02.dbf' size 300m autoextend on next 50m maxsize 800m;
+
+Create a second table to push extents into
+
+Connect as SHRINKU user:
+
+sqlplus shrinku/"Welcome_26ai"@localhost:1521/PDB
+
+Create T2 table and fill it with data:
+
+SQL> create table t2_big (
+  id  number,
+  pad varchar2(4000)
+) tablespace tbs_shrink_test;
+SQL> insert /*+ append */ into t2_big(id, pad)
+select level, rpad('Y', 3900, 'Y')
+from   dual
+connect by level <= 60000; 
+commit;
+
+Create a free file scenario
+
+Stay connected as SHRINKU  user and drop T2 table to create “free file” scenario:
+
+SQL> drop table t2_big purge;
+
+Do baseline checks before shrink
+As SYS user, check datafile sizes:
+
+SQL> col file_name for a60
+
+SQL> select 
+       file_name,
+       round(bytes/1024/1024) as mb
+from   dba_data_files
+where  tablespace_name = 'TBS_SHRINK_TEST';
+
+Check how much segment space is used in the tablespace:
+
+SQL> col segment_name for a30
+SQL> select segment_name, round(bytes/1024/1024) as mb
+     from   dba_segments
+     where  tablespace_name = 'TBS_SHRINK_TEST'
+     order  by mb desc;
+
+For each datafile in TBS_SHRINK_TEST, check how big the file is right now, and how much space inside it is currently free, unallocated to any segment:
+
+SQL> select df.file_id,
+       round(df.bytes/1024/1024) as df_mb,
+       round(nvl(fs.free_bytes,0)/1024/1024) as free_mb
+from   dba_data_files df
+left join(
+    select file_id, sum(bytes) free_bytes
+    from   dba_free_space
+    where  tablespace_name = 'TBS_SHRINK_TEST'
+    group  by file_id
+ ) fs on fs.file_id = df.file_id
+where  df.tablespace_name = 'TBS_SHRINK_TEST'
+order  by df.file_id;
+
+Run SHRINK_TABLESPACE in ANALYZE mode with report
+As SYS user, execute dbms_space.shrink_tablespace procedure to analyze and print the returned CLOB:
+
+SQL> set serveroutput on
+ declare
+  l_result clob;
+ begin
+  dbms_space.shrink_tablespace(
+   ts_name        => 'TBS_SHRINK_TEST',
+   shrink_mode    => dbms_space.ts_shrink_mode_analyze,
+   target_size    => dbms_space.ts_target_max_shrink,
+   shrink_result  => l_result,
+   iterations     => 1,
+   drop_datafiles => false
+);
+ dbms_output.put_line(dbms_lob.substr(l_result, 32767, 1));
+
+end;
+/
+
+Run ONLINE shrink and capture the report
+
+Connect as SYS user and run:
+
+set serveroutput on
+ declare
+   l_result clob;
+begin
+  dbms_space.shrink_tablespace(
+    ts_name        => 'TBS_SHRINK_TEST',
+    shrink_mode    => dbms_space.ts_shrink_mode_online,
+    target_size    => dbms_space.ts_target_max_shrink,
+    shrink_result  => l_result,
+    iterations     => 1,        -- start with 1 for a gentle test
+    drop_datafiles => false     -- keep files for now
+  );
+
+ dbms_output.put_line(dbms_lob.substr(l_result, 32767, 1));
+end;
+/
+
+Verify size after shrink
+
+For each datafile in TBS_SHRINK_TEST, check how big the file is right now, and how much space inside it is currently free, unallocated to any segment:
+
+SQL> select df.file_id,
+       round(df.bytes/1024/1024) as df_mb,
+       round(nvl(fs.free_bytes,0)/1024/1024) as free_mb
+from   dba_data_files df
+left join(
+    select file_id, sum(bytes) free_bytes
+    from   dba_free_space
+    where  tablespace_name = 'TBS_SHRINK_TEST'
+    group  by file_id
+ ) fs on fs.file_id = df.file_id
+where  df.tablespace_name = 'TBS_SHRINK_TEST'
+order  by df.file_id;
+
+Let’s test DROP_DATAFILES is TRUE option
+
+If the second file becomes empty after moves, Oracle can drop it if we indicate drop_datafiles => true:
+
+Connect as SYS user and run:
+
+SQL> set serveroutput on
+SQL> declare
+   l_result clob;
+begin
+  dbms_space.shrink_tablespace(
+    ts_name        => 'TBS_SHRINK_TEST',
+    shrink_mode    => dbms_space.ts_shrink_mode_online,
+    target_size    => dbms_space.ts_target_max_shrink,
+    shrink_result  => l_result,
+    iterations     => 1,        
+    drop_datafiles => true     
+  );
+
+ dbms_output.put_line(dbms_lob.substr(l_result, 32767, 1));
+end;
+/
+
+Verify tablespace after shrinking with drop
+
+Connect as SYS user and run:
+
+SQL> select df.file_id,
+       round(df.bytes/1024/1024) as df_mb,
+       round(nvl(fs.free_bytes,0)/1024/1024) as free_mb
+from   dba_data_files df
+left join(
+    select file_id, sum(bytes) free_bytes
+    from   dba_free_space
+    where  tablespace_name = 'TBS_SHRINK_TEST'
+    group  by file_id
+ ) fs on fs.file_id = df.file_id
+where  df.tablespace_name = 'TBS_SHRINK_TEST'
+order  by df.file_id;
+
+Readd a second datafile to the existing tablespace
+
+Since the datafile was dropped by the previous test, we need to re-add the datafile to the tablespace.
+
+Connect as SYS user:
+
+sqlplus / as sysdba
+
+SQL> alter session set container=pdb;
+
+Add the second datafile to tbs_shrink_test tablespace:
+
+alter tablespace tbs_shrink_test
+add datafile '+DATA' size 300m autoextend on next 50m maxsize 800m;
+
+If you have datafiles on filesystems, then indicate the path:
+
+alter tablespace tbs_shrink_test
+add datafile '/u01/app/oracle/oradata/ORCL/PDB/tbs_shrink_test02.dbf' size 300m autoextend on next 50m maxsize 800m;
+
+Create a table that we will pin into the new datafile
+
+Connect as SHRINKU and run:
+
+SQL> create table t_move_demo(
+  id  number,
+  pad varchar2(4000)
+) tablespace tbs_shrink_test;
+
+Now force extent allocations into file #15 using ALLOCATE EXTENT ... DATAFILE:
+
+SQL> alter table t_move_demo allocate extent(
+  size 64m
+  datafile '/u01/app/oracle/oradata/ORCL/PDB/tbs_shrink_test02.dbf'
+);
+
+SQL> alter table t_move_demo allocate extent(
+  size 64m
+  datafile '/u01/app/oracle/oradata/ORCL/PDB/tbs_shrink_test02.dbf'
+);
+
+Put some data in it 
+
+Connect as SHRINKU and run:
+
+SQL> insert /*+ append */ into t_move_demo
+select level, rpad('M', 3900, 'M')
+from dual
+connect by level <= 20000;
+
+commit;
+
+Prove that T_MOVE_DEMO has extents in the new datafile
+
+The output from the following query proves the table T_MOVE_DEMO is physically spread across multiple datafiles #14 and #16, so object movement is now possible, and likely required, if you try to shrink the tablespace and especially if you want to drop an empty file.
+
+SQL> col segment_name for a30
+SQL> select segment_name, 
+            file_id, 
+            round(sum(bytes)/1024/1024) mb
+from   dba_extents
+where  owner = 'SHRINKU'
+and    segment_name = 'T_MOVE_DEMO'
+group  by segment_name, file_id
+order  by file_id;
+
+Re-check free space by file
+
+Run the following query to determine how much space is allocated and how much is free:
+
+SQL> select df.file_id,
+       round(df.bytes/1024/1024) as df_mb,
+       round(nvl(fs.free_bytes,0)/1024/1024) as free_mb
+from   dba_data_files df
+left join(
+    select file_id, sum(bytes) free_bytes
+    from   dba_free_space
+    where  tablespace_name = ‘TBS_SHRINK_TEST’
+    group  by file_id
+) fs on fs.file_id = df.file_id
+where  df.tablespace_name = ‘TBS_SHRINK_TEST’
+order  by df.file_id;
+
+Resize the datafile #14
+
+To better achieve our desired test scenario, resize datafile 14 to provide space for extent movement:
+
+SQL> alter database datafile 14 resize 600m;
+
+Run ANALYZE again 
+
+Run the dbms_space.shrink_tablespace procedure with the following parameters. Now movement should be possible.
+
+Connect as SYS user and run:
+
+SQL> set serveroutput on
+declare
+  l_result clob;
+begin
+  dbms_space.shrink_tablespace(
+    ts_name        => 'TBS_SHRINK_TEST',
+    shrink_mode    => dbms_space.ts_shrink_mode_online,
+    target_size    => dbms_space.ts_target_max_shrink,
+    shrink_result  => l_result,
+    iterations     => 3,
+    drop_datafiles => true
+  );
+  dbms_output.put_line(dbms_lob.substr(l_result, 32767, 1));
+end;
+/
+
+Check the free space
+
+Rerun the previous query to check free space per datafile:
+
+SQL> select df.file_id,
+       round(df.bytes/1024/1024) as df_mb,
+       round(nvl(fs.free_bytes,0)/1024/1024) as free_mb
+from   dba_data_files df
+left join(
+    select file_id, sum(bytes) free_bytes
+    from   dba_free_space
+    where  tablespace_na  2  me = 'TBS_SHRINK_TEST'
+    group  by file_id
+) fs on fs.file_id = df.file_id
+where  df.tablespace_name = 'TBS_SHRINK_TEST'
+order  by df.file_id;
+
+
+Check the segment allocation
+
+Confirm where the table’s extents physically live after the shrink:
+
+SQL> col segment_name for a30
+SQL> select segment_name, 
+            file_id, 
+            round(sum(bytes)/1024/1024) mb
+from   dba_extents
+where  owner = 'SHRINKU'
+and    segment_name = 'T_MOVE_DEMO'
+group  by segment_name, file_id
+order  by file_id;
+

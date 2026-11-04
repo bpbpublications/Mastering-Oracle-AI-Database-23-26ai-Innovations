@@ -1,0 +1,167 @@
+-- Create books table
+
+create table books (
+  book_id     number primary key,
+  title       varchar2(100),
+  genre       varchar2(50),
+  author      varchar2(100)
+);
+
+-- Create reviews table referencing books
+
+create table reviews (
+  review_id   number primary key,
+  book_id     number references books(book_id),
+  reviewer    varchar2(50),
+  rating      number(2,1),
+  comments    varchar2(200)
+);
+
+-- Insert sample data into books
+insert into books values (1, 'The Silent Patient', 'Thriller', 'Alex Michaelides');
+insert into books values (2, 'Educated', 'Memoir', 'Tara Westover');
+insert into books values (3, 'Project Hail Mary', 'Science Fiction', 'Andy Weir');
+
+-- Insert sample data into reviews
+insert into reviews values (101, 1, 'Alice', 4.5, 'Suspenseful and gripping!');
+insert into reviews values (102, 1, 'Bob', 4.0, 'Kept me guessing.');
+insert into reviews values (103, 2, 'Charlie', 5.0, 'Incredibly inspiring.');
+insert into reviews values (104, 3, 'Diana', 4.8, 'Creative and fun sci-fi.');
+insert into reviews values (105, 3, 'Eve', 4.7, 'Loved the science details!');
+
+commit;
+
+--Using SQL/JSON syntax, we define how each part of the document maps to relational tables and explicitly declare which operations are permitted: insert and update (not delete) on the source tables.
+
+
+create or replace json relational duality view books_dv as
+select json {
+  '_id'     : b.book_id,
+  'title'   : b.title,
+  'author'  : b.author,
+  'genre'   : b.genre,
+  'reviews' :
+    [ select json {
+        'review_id': r.review_id,
+        'reviewer' : r.reviewer,
+        'rating'   : r.rating,
+        'comment'  : r.comments }
+      from reviews r with insert update
+      where r.book_id = b.book_id ]
+}
+from books b with insert update;
+
+
+-- You can describe the view structure using the following command:
+desc books_jcv;
+
+
+--To retrieve details for a specific book and its associated reviews, you can run the following query:
+select json_serialize(b.data pretty) as data
+from   books_jcv b
+where  b.data."_id" = 3;
+
+--In our JSON relational duality view, the DELETE operation is explicitly excluded. As a result, attempting to perform a DELETE in the following example should trigger an error:
+
+delete from books_dv b
+where b.data."_id" = 3;
+
+
+--insert statement succeeds:
+
+insert into books_dv (data)
+values (
+  json('{
+    "_id"     : 4,
+    "title"   : "The Midnight Library",
+    "author"  : "Matt Haig",
+    "genre"   : "Fantasy",
+    "reviews" : [
+      {
+"review_id": 106,
+"reviewer" : "Sam",
+        "rating"   : 4.6,
+        "comment"  : "Thought-provoking and emotional."
+      },
+      {
+        "review_id": 107,
+        "reviewer" : "Lena",
+        "rating"   : 4.8,
+        "comment"  : "Beautifully written and deeply moving."
+      }
+    ]
+  }')
+);
+
+commit;
+
+--Querying the JSON document and observing the current etag value:
+SQL> set pagesize 100
+
+select json_serialize(d.data pretty)
+from   books_dv d
+where  d.data."_id" = 2;
+
+
+--The following example demonstrates how to update a book document using value-based concurrency. We include the current etag to ensure the update only proceeds if the document hasn't changed:
+
+update books_dv b
+set b.data = ('
+{
+  "_metadata" : {"etag" : "470BB5905646DDBF2966B35414B33C21"},
+  "_id" : 2,
+  "title" : "Mastering JSON in Oracle",
+  "author" : "A. Author",
+  "genre" : "Memoir",
+  "reviews" : [
+    {
+      "review_id" : 108,
+      "reviewer" : "John Doe",
+      "rating" : 5,
+      "comment" : "Excellent resource!"
+    }
+  ]
+}')
+where b.data."_id" = 2;
+
+
+--When we query the same row afterward, we’ll notice that the etag value has changed, indicating the document has been modified:
+
+select json_serialize(d.data pretty)
+from   books_dv d
+where  d.data."_id" = 2;
+
+-- Index on the foreign key for faster join resolution
+create index reviews_book_fk_idx on reviews(book_id);
+
+-- Index on common filter field
+create index books_title_idx on books(title);
+
+
+-- Partition books table by genre
+create table books (
+  book_id number,
+  title   varchar2(100),
+  genre   varchar2(50),
+  ...
+)
+partition by list (genre) (
+  partition p_thriller values ('Thriller'),
+  partition p_memoir   values ('Memoir'),
+  partition p_sci_fi   values ('Science Fiction')
+);
+
+--Duality views can benefit from Oracle’s in-memory option. Storing frequently queried tables (small tables, not large) in memory can significantly boost JSON serialization and read operations.
+
+alter table books inmemory;
+alter table reviews inmemory;
+
+-- Filter specific title instead of fetching all documents
+select json_serialize(data pretty)
+from books_dv
+where data.title = 'Project Hail Mary';
+
+
+-- Example AWR snapshot range for review
+@?/rdbms/admin/awrrpt.sql
+

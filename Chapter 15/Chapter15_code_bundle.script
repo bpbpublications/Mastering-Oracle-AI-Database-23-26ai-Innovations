@@ -1,0 +1,293 @@
+Start by checking whether Heat Map is enabled in your target container by running the following command:
+
+SQL> show parameter HEAT_MAP
+
+
+Enable Heat Map either across all containers (CDB$ROOT) or only for a specific PDB:
+
+-- Enable Heat Map in all PDBs (run in CDB$ROOT)
+ALTER SYSTEM SET heat_map = ON CONTAINER=ALL;
+
+-- Enable Heat Map only in one PDB
+ALTER SESSION SET CONTAINER = PDB;
+ALTER SYSTEM SET heat_map = ON;
+
+
+For the tiering demo, we need an “archive” tablespace. If Oracle-Managed Files is used, the command works without file paths as follows:
+
+CREATE TABLESPACE tbs_archive;
+
+In the same PDB, create a sample user with the necessary permissions:
+
+CREATE USER demo IDENTIFIED BY demo QUOTA UNLIMITED ON users;
+ALTER USER demo QUOTA UNLIMITED ON tbs_archive;
+GRANT connect, resource, execute any procedure TO demo;
+GRANT execute ON dbms_ilm_admin TO demo;
+
+Connect with the newly created demo user and create a range-interval partitioned table:
+
+sqlplus demo/demo@localhost:1521/PDB
+
+CREATE TABLE sales_ado
+(
+  sale_id     NUMBER        NOT NULL,
+  sale_date   DATE          NOT NULL,
+  customer_id NUMBER        NOT NULL,
+  amount      NUMBER(10,2)  NOT NULL,
+  CONSTRAINT sales_ado_pk PRIMARY KEY (sale_id)
+)
+PARTITION BY RANGE (sale_date)
+INTERVAL (NUMTOYMINTERVAL(1,'MONTH'))
+(
+  PARTITION p_start VALUES LESS THAN (DATE '2025-01-01')
+);
+
+Insert “cold” rows into P_START (old dates):
+
+INSERT INTO sales_ado
+SELECT
+  LEVEL,
+  DATE '2024-06-01' + MOD(LEVEL, 10),
+  MOD(LEVEL, 5000) + 1,
+  ROUND(DBMS_RANDOM.VALUE(10, 500), 2)
+FROM dual
+CONNECT BY LEVEL <= 1000;
+
+COMMIT;
+
+Insert “hot” rows to create interval partitions (new dates):
+
+INSERT INTO sales_ado
+SELECT
+  100000 + LEVEL,
+  DATE '2026-01-15' + MOD(LEVEL, 10),
+  MOD(LEVEL, 5000) + 1,
+  ROUND(DBMS_RANDOM.VALUE(10, 500), 2)
+FROM dual
+CONNECT BY LEVEL <= 1000;
+
+COMMIT;
+
+
+Gather table statistics:
+
+BEGIN
+  DBMS_STATS.GATHER_TABLE_STATS(USER, 'SALES_ADO');
+END;
+/
+
+Verify partitions:
+
+col PARTITION_NAME for a15
+
+SELECT partition_name, tablespace_name
+FROM   user_tab_partitions
+WHERE  table_name = 'SALES_ADO'
+ORDER  BY partition_position;
+
+
+Compression tiering (segment-level example):
+
+ALTER TABLE sales_ado
+  ILM ADD POLICY
+    ROW STORE COMPRESS ADVANCED
+    SEGMENT AFTER 5 DAYS OF NO ACCESS;
+
+
+Storage tiering (move to another tablespace):
+
+ALTER TABLE sales_ado
+  MODIFY PARTITION p_start
+  ILM ADD POLICY
+    TIER TO tbs_archive READ ONLY
+    SEGMENT AFTER 15 DAYS OF NO ACCESS;
+
+
+To do that, we run ILM manually using DBMS_ILM.EXECUTE_ILM:
+
+SET SERVEROUTPUT ON
+DECLARE
+  v_task_id NUMBER;
+BEGIN
+  DBMS_ILM.EXECUTE_ILM(
+    owner          => 'DEMO',      -- use the actual table owner
+    object_name    => 'SALES_ADO', -- use the actual table name
+    task_id        => v_task_id,
+    execution_mode => DBMS_ILM.ILM_EXECUTION_OFFLINE
+  );
+  DBMS_OUTPUT.PUT_LINE('ADO task id = ' || v_task_id);
+END;
+/
+
+After executing ILM, you can check whether a task was created:
+SELECT task_id, state
+       ,creation_time
+FROM  user_ilmtasks
+ORDER BY creation_time DESC;
+
+
+To switch ILM policy time interpretation from days to seconds, run the following:
+BEGIN
+  DBMS_ILM_ADMIN.CUSTOMIZE_ILM(
+    parameter => DBMS_ILM_ADMIN.POLICY_TIME,
+    value     => DBMS_ILM_ADMIN.ILM_POLICY_IN_SECONDS
+  );
+END;
+/
+
+Don’t leave it enabled in real environments. To revert that setting, set the POLICY_TIME parameter back to the default days unit:
+
+BEGIN
+  DBMS_ILM_ADMIN.CUSTOMIZE_ILM(
+    parameter => DBMS_ILM_ADMIN.POLICY_TIME,
+    value     => DBMS_ILM_ADMIN.ILM_POLICY_IN_DAYS
+  );
+END;
+/
+
+
+Run the following query once, then do not touch the data:
+
+SELECT /*+ FULL(s) NO_INDEX(s) */ SUM(s.amount)
+FROM   demo.sales_ado s;
+
+
+--
+
+set linesize 800
+col OBJ_NAME for a15
+col SUB_NAME for a15
+alter session set NLS_DATE_FORMAT='DD-MON-YYYY HH24:MI:SS';
+
+SELECT object_name as obj_name
+       ,subobject_name as sub_name
+       ,track_time
+       ,n_full_scan
+       ,n_lookup_scan
+       ,n_segment_write 
+FROM v$heat_map_segment
+WHERE object_name LIKE 'SALES_ADO%';
+
+This query is showing Heat Map activity flags per segment and partition for objects whose name starts with SALES_ADO:
+
+Here’s a quick way to see that behavior, in one session, run the following query several times:
+
+SELECT /*+ FULL(s) NO_INDEX(s) */ SUM(s.amount)
+FROM   demo.sales_ado s;
+
+
+In another session, check the counters in v$heat_map_segment:
+
+set linesize 800
+col OBJ_NAME for a15
+col SUB_NAME for a15
+alter session set NLS_DATE_FORMAT='DD-MON-YYYY HH24:MI:SS';
+
+SELECT object_name as obj_name
+       ,subobject_name as sub_name
+       ,track_time
+       ,n_full_scan
+       ,n_lookup_scan
+       ,n_segment_write 
+FROM v$heat_map_segment
+WHERE object_name LIKE 'SALES_ADO%';
+
+
+Now disconnect from the 1st session where you ran the full-scan query, and check the counter from the 2nd session again:
+
+set linesize 800
+col OBJ_NAME for a15
+col SUB_NAME for a15
+alter session set NLS_DATE_FORMAT='DD-MON-YYYY HH24:MI:SS';
+
+SELECT object_name as obj_name
+       ,subobject_name as sub_name
+       ,track_time
+       ,n_full_scan
+       ,n_lookup_scan
+       ,n_segment_write 
+FROM v$heat_map_segment
+WHERE object_name LIKE 'SALES_ADO%';
+
+
+In the previous section, we touched on the data. Now let’s wait ~6 seconds , then force ILM execution:
+
+SET SERVEROUTPUT ON
+DECLARE
+  t NUMBER;
+BEGIN
+  DBMS_ILM.EXECUTE_ILM(
+    ilm_scope      => DBMS_ILM.SCOPE_SCHEMA,
+    execution_mode => DBMS_ILM.ILM_EXECUTION_OFFLINE,
+    task_id        => t
+  );
+  DBMS_OUTPUT.PUT_LINE('TASK_ID='||t);
+END;
+/
+
+Check the task creation:
+
+SELECT task_id, state, creation_time
+FROM   user_ilmtasks
+ORDER  BY creation_time DESC;
+
+
+Verify compression happened (but not move yet)
+
+SELECT partition_name, tablespace_name, compression, compress_for
+FROM   user_tab_partitions
+WHERE  table_name = 'SALES_ADO'
+ORDER  BY partition_position;
+
+
+To find the reason, query user_ilmresults  for the task created by your manual DBMS_ILM.EXECUTE_ILM run:
+
+SELECT comments
+FROM   user_ilmresults
+WHERE  task_id = 2;
+
+Since the compression policy worked, let’s wait until total idle time > 15 seconds, then execute ILM again:
+
+SET SERVEROUTPUT ON
+DECLARE
+  t NUMBER;
+BEGIN
+  DBMS_ILM.EXECUTE_ILM(
+    ilm_scope      => DBMS_ILM.SCOPE_SCHEMA,
+    execution_mode => DBMS_ILM.ILM_EXECUTION_OFFLINE,
+    task_id        => t
+  );
+  DBMS_OUTPUT.PUT_LINE('TASK_ID='||t);
+END;
+/
+
+Check the task creation:
+
+SELECT task_id, state, creation_time
+FROM   user_ilmtasks
+ORDER  BY creation_time DESC;
+
+
+Verify that movement happened:
+
+SELECT partition_name, tablespace_name, compression, compress_for
+FROM   user_tab_partitions
+WHERE  table_name = 'SALES_ADO'
+ORDER  BY partition_position;
+
+
+ 
+As we mentioned previously, don’t leave ILM policy time interpretation from days to seconds enabled in real environments. To revert that setting, set the POLICY_TIME parameter back to the default days unit:
+
+BEGIN
+  DBMS_ILM_ADMIN.CUSTOMIZE_ILM(
+    parameter => DBMS_ILM_ADMIN.POLICY_TIME,
+    value     => DBMS_ILM_ADMIN.ILM_POLICY_IN_DAYS
+  );
+END;
+/
+
+
+
+
+

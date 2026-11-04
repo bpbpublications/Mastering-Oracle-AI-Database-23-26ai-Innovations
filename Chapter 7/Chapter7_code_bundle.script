@@ -1,0 +1,141 @@
+--Create a table named emp with the following structure:
+
+CREATE TABLE emp (
+  empno     NUMBER(4) PRIMARY KEY,
+  ename     VARCHAR2(30),
+  job       VARCHAR2(10),
+  mgr       NUMBER(4),
+  hiredate  DATE,
+  sal       NUMBER(7,2),
+  deptno    NUMBER(2)
+);
+
+--Create a table named dept with the following structure:
+
+CREATE TABLE dept (
+  deptno   NUMBER(2) PRIMARY KEY,
+  dname    VARCHAR2(30),
+  loc      VARCHAR2(30)
+);
+
+
+--Insert three sample rows into emp table and commit the chances:
+
+INSERT INTO emp VALUES 
+(1000, 'MARI KUPATADZE',  'SA',     1001, TO_DATE('04-MAY-2013', 'DD-MON-YYYY'),  800, 20);
+
+INSERT INTO emp VALUES 
+(1001, 'SALI BERIDZE',  'CIO',  null, TO_DATE('04-MAY-2013', 'DD-MON-YYYY'), 8000, 20);
+
+INSERT INTO emp VALUES 
+(1002, 'ANA BERIDZE',   'CIO',  null, TO_DATE('14-NOV-2020', 'DD-MON-YYYY'), 8000,  20);
+
+-- Commit changes
+COMMIT;
+
+--Insert one row for department 20 into the dept table:
+	
+INSERT INTO dept (deptno, dname, loc)
+VALUES (20, 'IT', 'Maryland');
+
+-- Commit changes
+COMMIT;
+
+--The following script creates SQL macro named bonus_salary
+
+CREATE FUNCTION bonus_salary (sal NUMBER) 
+RETURN VARCHAR2 SQL_MACRO(SCALAR) IS
+BEGIN
+  RETURN q'{ CASE WHEN sal < 5000 THEN sal * 1.2 ELSE sal * 1.1 END }';
+END;
+/
+
+--To retrieve each employee’s name along with their calculated bonus salary, run the following query:
+
+SELECT ename, bonus_salary(sal) AS adjusted_salary
+FROM emp;
+
+--In the following example, we define a table SQL macro, which returns a SQL query.
+
+CREATE FUNCTION active_employees (min_salary NUMBER) 
+RETURN VARCHAR2 SQL_MACRO(TABLE) IS
+BEGIN
+  RETURN q'{ SELECT empno, ename, sal FROM emp WHERE sal > min_salary }';
+END;
+/
+
+--This following query retrieves all columns (*) from the active_employees(3000) call, which is a table SQL macro.
+
+SELECT *
+FROM active_employees(3000);
+
+--Ordinary PL/SQL function satisfying the same logic is the following:
+
+CREATE FUNCTION bonus_salary2 (sal NUMBER)
+RETURN NUMBER IS
+  v_bonus_sal NUMBER;
+BEGIN
+  IF sal < 5000 THEN
+    v_bonus_sal := sal * 1.2;
+  ELSE
+    v_bonus_sal := sal * 1.1;
+  END IF;
+  RETURN v_bonus_sal;
+END;
+/
+
+
+--Table SQL Macro:
+
+----If p_deptno is provided, it filters employees by department number.
+----If p_min_sal is provided, it filters employees by salary.
+----If either is NULL, that condition is ignored.
+
+CREATE OR REPLACE FUNCTION filter_employees (
+  p_deptno    NUMBER DEFAULT NULL,
+  p_min_sal   NUMBER DEFAULT NULL
+)
+RETURN VARCHAR2 SQL_MACRO(TABLE) IS
+BEGIN
+  RETURN q'{
+    SELECT empno, ename, job, sal, deptno
+    FROM emp
+    WHERE (p_deptno IS NULL OR deptno = p_deptno)
+      AND (p_min_sal IS NULL OR sal >= p_min_sal)
+  }';
+END;
+/
+
+--Filter only by department:
+SELECT * FROM filter_employees(20, NULL);
+
+--Filter only by salary:
+SELECT * FROM filter_employees(NULL, 5000);
+
+--Apply both filters:
+SELECT * FROM filter_employees(20, 5000);
+
+
+--This function defines a scalar SQL macro named calc_bonus. 
+
+CREATE OR REPLACE FUNCTION calc_bonus (sal NUMBER)
+RETURN VARCHAR2 SQL_MACRO(SCALAR) IS
+BEGIN
+  RETURN q'{
+    CASE 
+      WHEN sal < 3000 THEN sal * 0.15
+      WHEN sal BETWEEN 3000 AND 7000 THEN sal * 0.10
+      ELSE sal * 0.05
+    END
+  }';
+END;
+/
+
+
+--This query returns each employee’s name, salary, and a dynamically calculated bonus.
+
+SELECT ename, sal, calc_bonus(sal) AS bonus
+FROM emp;
+
+
+

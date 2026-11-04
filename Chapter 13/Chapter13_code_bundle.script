@@ -1,0 +1,92 @@
+--You can check the archive log mode by executing the following command in sqlplus:
+
+SELECT log_mode, database_role FROM v$database;
+
+
+--The command to install the RPM located under /opt/oracle/install/ is as follows:
+
+# yum install /opt/oracle/install/oracle-ai-database-
+oracle-ai-database-free-26ai-23.26.0-1.el8.x86_64.rpm
+
+--As oracle user, run DBCA using the following parameters. Make sure you specify a different unique name from the one used on the primary. When prompted, enter the password for SYS user for the source database:
+
+dbca -silent -createTrueCache \
+-gdbName FREE \
+-sid FREE \
+-sourceDBConnectionString vm1:1521/FREE \
+-passwordFileFromSourceDB /opt/oracle/tmp/orapwFREE \
+-dbUniqueName FREE_TC 
+
+
+--Connect to the True Cache instance using sqlplus and check open mode and database role:
+
+SQL> SELECT name, database_role, open_mode FROM v$database;
+
+
+--Check redo apply status using the following command:
+
+SQL> SELECT process, status FROM v$managed_standby WHERE process LIKE 'MRP%';
+
+--Check standby redo log members created on True Cache server with DBCA:
+
+SQL> select TYPE, MEMBER from v$logfile;
+
+--Query details about the relationship between a True Cache database and its primary database by running the following command:
+
+SQL> 
+set linesize 800
+col status for a7
+
+select my_dg_id,
+       remote_dg_id, 
+       true_cache_name, 
+       primary_name, 
+       status, 
+       remote_version 
+from v$true_cache;
+
+--Explore parameters for the True Cache instance, such as 
+
+SQL> show parameter true_cache
+
+--Verify if DML redirection is enabled by executing the following command:
+
+SQL> show parameter adg_redirect_dml
+
+--The following dbca command configures the corresponding True Cache application service on the primary database and activates the True Cache service on the True Cache instance. Execute this command separately for each True Cache application service that you need to configure.
+
+$ORACLE_HOME/bin/dbca -configureDatabase \
+-configureTrueCacheInstanceService \
+-sourceDB FREE \
+-trueCacheConnectString vm2:1521/FREE_TC \
+-trueCacheServiceName FREE_TC_SRV \
+-serviceName FREE_PRIM_SRV \
+-pdbName FREEPDB1 \
+-silent
+
+
+--The sample Java code example that demonstrates how to configure and test Oracle True Cache connectivity using the JDBC Thin driver and Universal Connection Pool (UCP) is as follows:
+
+import java.sql.*;
+import oracle.ucp.jdbc.PoolDataSource;
+import oracle.ucp.jdbc.PoolDataSourceFactory;
+System.setProperty("oracle.net.tns_admin", "/opt/oracle/product/26ai/dbhomeFree/network/admin");
+PoolDataSource pds = PoolDataSourceFactory.getPoolDataSource();
+pds.setConnectionFactoryClassName("oracle.jdbc.pool.OracleDataSource");
+pds.setURL("jdbc:oracle:thin:@FREE_PRIM_SRV");   // Primary service
+pds.setUser("hr");
+pds.setPassword("hr");
+// Enable True Cache logical connection
+pds.setConnectionProperty("oracle.jdbc.useTrueCacheDriverConnection", "true");
+try (Connection conn = pds.getConnection()) {
+    // Required for True Cache read-only switching
+
+    conn.setAutoCommit(true);   
+    // Read-write: routes to primary
+    conn.setReadOnly(false);
+    System.out.println("Read-write mode -> Primary");
+    // Read-only: automatically routes to True Cache
+    conn.setReadOnly(true);
+    System.out.println("Read-only mode -> True Cache");
+}
+

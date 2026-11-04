@@ -1,0 +1,242 @@
+-- Enabling the in-memory column store for a sales fact table with the following command:
+
+SQL> ALTER TABLE sales INMEMORY PRIORITY HIGH; 
+
+
+--Connect to the database and verify the parameter by executing the following command:
+
+SQL> show parameter INMEMORY_SIZE
+
+
+--Modify the INMEMORY_SIZE parameter and set it to 10G, select the value according to your environment.
+
+SQL> alter system set inmemory_size=10G scope=spfile;
+
+--Check the default setting:
+
+SQL> show parameter INMEMORY_AUTOMATIC_LEVEL
+
+NAME                 TYPE     VALUE
+-------------------------- ------- ----------------
+inmemory_automatic_level     string  OFF
+
+--Set the parameter to MEDIUM:
+
+SQL>  alter system set inmemory_automatic_level=MEDIUM;
+
+--Connect to the database and check the V$MEMORY_DYNAMIC_COMPONENTS view, also filter rows by searching for the "Memory” keyword:
+
+
+SQL> SELECT component
+           ,user_specified_size/1024/1024/1024 as "GB"
+     FROM v$memory_dynamic_components
+     WHERE component like '%Memory%';
+
+--Create a user in a standard tablespace (e.g., USERS), not SYS/SYSTEM.
+
+SQL> ALTER SESSION SET container = PDB;  
+
+SQL> CREATE USER imdemo IDENTIFIED BY imdemo
+  DEFAULT TABLESPACE users
+  QUOTA UNLIMITED ON users;
+
+SQL> GRANT connect, resource, select_catalog_role TO imdemo;
+
+
+--Connect as imdemo user and create a sales_im table using the following command to create a sample table:
+
+sqlplus imdemo/imdemo@localhost:1521/PDB
+
+
+SQL> CREATE TABLE sales_im (
+    sale_id       NUMBER,
+    sale_date     DATE,
+    cust_id       NUMBER,
+    product_id    NUMBER,
+    amount_sold   NUMBER(10,2)
+)
+INMEMORY
+PRIORITY HIGH;
+
+
+
+--Check that in-memory is enabled
+
+SQL> SELECT table_name, inmemory, inmemory_priority
+FROM   user_tables
+WHERE  table_name = 'SALES_IM';
+
+
+--Insert sample data
+
+INSERT INTO sales_im
+SELECT level AS sale_id,
+       SYSDATE - MOD(level, 365) AS sale_date,
+       TRUNC(DBMS_RANDOM.VALUE(1, 50000)) AS cust_id,
+       TRUNC(DBMS_RANDOM.VALUE(1, 1000))  AS product_id,
+       ROUND(DBMS_RANDOM.VALUE(10, 500), 2) AS amount_sold
+FROM dual
+CONNECT BY level <= 100000;   -- 100K rows
+/
+
+COMMIT;
+
+
+--Check if in-memory segments are populated.
+
+SELECT segment_name, populate_status, bytes_not_populated
+FROM   v$im_segments
+WHERE  segment_name = 'SALES_IM';
+
+
+--Force population into in-memory (optional)
+
+BEGIN
+  DBMS_INMEMORY.POPULATE(
+    schema_name => USER,
+    table_name  => 'SALES_IM'
+  );
+END;
+/
+
+
+--Check if in-memory segments are populated
+
+SELECT segment_name, populate_status, bytes_not_populated
+FROM   v$im_segments
+WHERE  segment_name = 'SALES_IM';
+
+
+--Make sure the optimizer has stats
+
+BEGIN
+  DBMS_STATS.GATHER_TABLE_STATS(
+    ownname => USER,
+    tabname => 'SALES_IM',
+    cascade => TRUE
+  );
+END;
+/
+
+
+--Run a representative analytic query
+
+ALTER SESSION SET statistics_level = ALL;
+
+SELECT cust_id,
+       SUM(amount_sold) AS total_amt
+FROM   sales_im
+GROUP  BY cust_id;
+
+
+--Display the execution plan with DBMS_XPLAN
+
+SELECT *
+FROM   TABLE(
+         DBMS_XPLAN.DISPLAY_CURSOR(
+           NULL, NULL,
+           'ALLSTATS LAST +ALIAS +NOTE'
+         )
+       );
+
+
+
+-- This is a section for a ready-to-run SQL script that should be executed by the imdemo user:
+
+--------------------------------------------------------------------------------
+-- 1. Create Dimension Table: DIM_PRODUCTS
+--------------------------------------------------------------------------------
+DROP TABLE dim_products PURGE;
+
+CREATE TABLE dim_products(
+    prod_id      NUMBER PRIMARY KEY,
+    category     VARCHAR2(50),
+    prod_name    VARCHAR2(100)
+);
+
+-- Insert sample product categories
+
+INSERT INTO dim_products
+SELECT level,
+       CASE
+           WHEN MOD(level, 4) = 0 THEN 'ELECTRONICS'
+           WHEN MOD(level, 4) = 1 THEN 'HOME'
+           WHEN MOD(level, 4) = 2 THEN 'SPORTS'
+           ELSE 'TOYS'
+       END,
+       'Product ' || level
+FROM dual
+CONNECT BY level <= 1000;
+
+COMMIT;
+
+
+--------------------------------------------------------------------------------
+-- 2. Create Fact Table: FACT_SALES
+--    Large table to force hash join + Bloom filter usage
+--------------------------------------------------------------------------------
+DROP TABLE fact_sales PURGE;
+
+CREATE TABLE fact_sales(
+    sales_id     NUMBER,
+    prod_id      NUMBER,
+    customer_id  NUMBER,
+    sales_date   DATE,
+    sales_amount NUMBER(10,2)
+)
+NOLOGGING;
+
+-- Insert ~1 million rows for realistic join behavior
+INSERT /*+ APPEND */ INTO fact_sales
+SELECT level,
+       MOD(level, 1000) + 1,                     -- matches DIM_PRODUCTS
+       TRUNC(DBMS_RANDOM.VALUE(1, 500000)),
+       SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 365)),
+       ROUND(DBMS_RANDOM.VALUE(10, 1000), 2)
+FROM dual
+CONNECT BY level <= 1000000;
+
+COMMIT;
+
+
+--------------------------------------------------------------------------------
+-- 3. Gather Optimizer Statistics
+--------------------------------------------------------------------------------
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(USER, 'DIM_PRODUCTS', cascade => TRUE);
+    DBMS_STATS.GATHER_TABLE_STATS(USER, 'FACT_SALES', cascade => TRUE);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- 4. Example Query to Trigger Bloom Filters
+--------------------------------------------------------------------------------
+
+-- Enable parallelism on the tables
+ALTER SESSION SET parallel_degree_policy = MANUAL;
+ALTER TABLE dim_products  PARALLEL 4;
+ALTER TABLE fact_sales    PARALLEL 4;
+
+-- Enable good stats collection
+ALTER SESSION SET statistics_level = ALL;
+
+SELECT /*+ USE_HASH(f d) */ 
+       f.prod_id,
+       SUM(f.sales_amount)
+FROM   fact_sales f
+JOIN   dim_products d
+ON     f.prod_id = d.prod_id
+WHERE  d.category = 'ELECTRONICS'
+GROUP BY f.prod_id;
+
+
+--------------------------------------------------------------------------------
+-- 5. Display Execution Plan with Bloom Filter Info
+--------------------------------------------------------------------------------
+SELECT *
+FROM   TABLE(
+         DBMS_XPLAN.DISPLAY_CURSOR(
+           NULL, NULL,
+           'ALLSTATS LAST +ALIAS +NOTE'
+         )
+       );

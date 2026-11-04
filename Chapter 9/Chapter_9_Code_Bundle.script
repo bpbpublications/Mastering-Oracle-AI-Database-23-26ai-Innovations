@@ -1,0 +1,64 @@
+--For example, the following query forces SQL monitoring to be activated:
+
+SELECT /*+ MONITOR */ department_id, AVG(salary), COUNT(*)
+FROM   hr.employees
+GROUP BY department_id
+ORDER BY department_id;
+
+--On the other hand, the NO_MONITOR hint turns off real-time SQL monitoring for the query, even if it runs for an extended period. Here's an example that disables monitoring:
+
+SELECT /*+ NO_MONITOR */ department_id, AVG(salary), COUNT(*)
+FROM   hr.employees
+GROUP BY department_id
+ORDER BY department_id;
+
+--Example create sales_data_1 table with the following characteristics:
+
+CREATE TABLE sales_data_1 (
+       sale_id        NUMBER,
+       product_id     NUMBER,
+       customer_id    NUMBER,
+       sale_date      DATE,
+       amount         NUMBER(10,2),
+       discount       NUMBER(5,2),
+       region         VARCHAR2(50),
+       notes          CLOB)
+       INMEMORY
+       INMEMORY(ALL)
+       NO INMEMORY(notes, discount);  
+
+--Connect to the database using sqlplus and check which columns are in memory by querying the following view:
+
+set linesize 800
+col column_name for a50
+SELECT column_name,
+       inmemory_compression
+FROM v$im_column_level
+WHERE  table_name in ('SALES_DATA_1')
+ORDER BY segment_column_id;
+
+--For example, create sales_data_2 table with the following characteristics:
+
+CREATE TABLE sales_data_2 (
+       sale_id        NUMBER,
+       product_id     NUMBER,
+       customer_id    NUMBER,
+       sale_date      DATE,
+       amount         NUMBER(10,2),
+       discount       NUMBER(5,2),
+       region         VARCHAR2(50),
+       notes          CLOB)
+       INMEMORY
+       NO INMEMORY(ALL)
+       INMEMORY(notes, discount);  
+
+--Check which columns are in memory by querying the following view:
+
+set linesize 800
+col column_name for a50
+SELECT column_name,
+       inmemory_compression
+FROM v$im_column_level
+WHERE  table_name in ('SALES_DATA_2')
+ORDER BY segment_column_id;
+

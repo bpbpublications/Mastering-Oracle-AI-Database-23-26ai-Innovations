@@ -1,0 +1,149 @@
+--You can verify the base version by running the following query after connecting to the database using sqlplus:
+SELECT BANNER FROM V$VERSION;
+
+--To check the full version including patch level, run the following query:
+SELECT BANNER_FULL FROM V$VERSION;
+
+--You can view the available OPatch commands by using the help option:
+$ $ORACLE_HOME/OPatch/opatch -help
+
+--For specific commands, specify the action first, followed by the -help option, for example: 
+$ $ORACLE_HOME/OPatch/opatch apply -help
+
+-- You can view the available OPatchAuto commands by using the help option:
+$ $ORACLE_HOME/OPatch/opatchauto -help
+
+--For specific commands, specify the action first, followed by the -help option:
+$ $ORACLE_HOME/OPatch/opatchauto apply -help
+$ $ORACLE_HOME/OPatch/opatchauto rollback -help    
+$ $ORACLE_HOME/OPatch/opatchauto report -help
+$ $ORACLE_HOME/OPatch/opatchauto resume -help
+
+
+--To check the current OPatch utility version, run the following command as oracle (home owner) user: 
+$ $ORACLE_HOME/OPatch/opatch version
+
+--To update OPatch for the RDBMS home, set ORACLE_HOME to the correct path, delete the current OPatch folder, and unzip the new OPatch into that location:
+
+$ export ORACLE_HOME=/u01/app/oracle/product/23ai/dbhome_1
+$ rm -rf $ORACLE_HOME/OPatch
+$ unzip -o /patch/p6880880_230000_LINUX.zip -d $ORACLE_HOME
+
+--Repeat the same step for GI home as well: 
+
+$ export ORACLE_HOME=/u01/app/23ai/grid
+$ rm -rf $ORACLE_HOME/OPatch
+$ unzip -o /patch/p6880880_230000_LINUX.zip -d $ORACLE_HOME
+
+--Check OPatch version again:
+
+$ $ORACLE_HOME/OPatch/opatch version
+
+--If the patch has not been unzipped yet, set the appropriate ownership and permissions and extract it to the target directory:
+
+# chown -R oracle:oinstall /patch
+# chmod -R 775 /patch
+# su – oracle
+$ unzip p37366180_230000_Linux-x86-64.zip -d /patch
+$ unzip p37353687_230000_Linux-x86-64.zip -d /patch
+
+--For GI RU, assign permissions according to your environment, in our case we need to change the owner to root:oinstall as follows:
+
+# chown -R root:oinstall /patch/37353687 
+
+--In our example, we are applying patch number 37366180 on RDBMS home and 37353687 on GI home, that have been extracted to the /patch directory. Therefore, the prerequisite check commands will be the following:
+
+$ export ORACLE_HOME=/u01/app/oracle/product/23ai/dbhome_1
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37366180
+
+
+--The prerequiste commands for GI home will be the following:
+
+$ export ORACLE_HOME=/u01/app/23ai/grid
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37353687/37366180
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37353687/37369888
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37353687/37369896
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37353687/37369900
+
+$ $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph /patch/37353687/37369904
+
+
+--Export environment variables 
+
+----Connect as root user and export ORACLE_SID, ORACLE_HOME and PATH for GI home as following:
+
+$ su - 
+# export ORACLE_SID=+ASM
+# export ORACLE_HOME=/u01/app/23ai/grid
+# export PATH=/home/oracle/.local/bin:/home/oracle/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/u01/app/23ai/grid/bin
+
+
+--Switch to the patch directory and apply from top folder using opatchauto as follows:
+
+# $ORACLE_HOME/OPatch/opatchauto apply /patch/37353687 -oh /u01/app/23ai/grid
+
+--Apply RU on RDBMS home using opatch utility
+
+----Connect as oracle user, export environment variables and run the apply command, and respond “y” when prompted:
+
+$ export ORACLE_HOME=/u01/app/oracle/product/23ai/dbhome_1
+$ export PATH=/home/oracle/.local/bin:/home/oracle/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/u01/app/oracle/product/23ai/dbhome_1/bin
+
+$ $ORACLE_HOME/OPatch/opatch apply /patch/37366180 -oh /u01/app/oracle/product/23ai/dbhome_1
+
+--Connect as root user and start HAS using the following command:
+
+# crsctl status has
+
+
+--To confirm that the patch was successfully applied, run the lspatches commands on RDBMS and GI homes separately:
+
+$ORACLE_HOME/OPatch/opatch lspatches
+
+--Export environment variables for RDBMS home, connect to the sqlplus and load modified SQL files into the database:
+
+$ export ORACLE_HOME=/u01/app/oracle/product/23ai/dbhome_1
+$ export PATH=/home/oracle/.local/bin:/home/oracle/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/u01/app/oracle/product/23ai/dbhome_1/bin
+$ export ORACLE_SID=orcl
+
+SQL> alter pluggable database all open;
+
+SQL> quit
+
+$ cd $ORACLE_HOME/OPatch
+$ ./datapatch -sanity_checks (optional)
+$ ./datapatch -verbose
+
+--Check the patch status in dba_registry_sqlpatch by running the following SQL statement:
+
+SQL> SELECT patch_id, patch_type, status, action, action_time
+FROM dba_registry_sqlpatch;
+
+
+--Gather dictionary statistics to help the optimizer (optional but recommended):
+
+EXEC dbms_stats.gather_dictionary_stats;
+
+--Review if any database has invalid objects by running the following query:
+
+SQL> select count(*) from dba_objects where status!='VALID';
+
+--Any (pluggable) database that has invalid objects after the execution of datapatch should run catcon.pl to revalidate those objects. 
+
+----For example:
+
+$ export ORACLE_HOME=/u01/app/oracle/product/23ai/dbhome_1
+$ export PATH=$PATH:$ORACLE_HOME/bin
+$ cd $ORACLE_HOME/rdbms/admin
+$ $ORACLE_HOME/perl/bin/perl $ORACLE_HOME/rdbms/admin/catcon.pl -n 1 -e -b utlrp -d $ORACLE_HOME/rdbms/admin utlrp.sql
+
+--Review invalid objects again:
+
+SQL> select count(*) from dba_objects where status!='VALID';
+
+
